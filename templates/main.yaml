@@ -1,0 +1,118 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Mappings:
+  Configuration:
+    lambda:
+      Timeout: 15
+    log:
+      RetentionInDays: 7
+
+Resources:
+  Topic:
+    Type: AWS::SNS::Topic
+
+  TopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref Topic
+      PolicyDocument:
+        Id: !GetAtt Topic.TopicName
+        Version: 2012-10-17
+        Statement:
+          - Sid: !GetAtt Topic.TopicName
+            Effect: Allow
+            Action:
+              - sns:Publish
+            Resource: !Ref Topic
+            Principal:
+              AWS: !Ref AWS::AccountId
+              Service:
+                - s3.amazonaws.com
+
+  Bucket:
+    DependsOn: TopicPolicy
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Topic: !Ref Topic
+            Event: s3:ObjectCreated:*
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: !FindInMap [ Configuration, lambda, Timeout ]
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 1
+
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref Queue
+      PolicyDocument:
+        Statement:
+          Effect: Allow
+          Action:
+            - sqs:SendMessage
+          Principal:
+            AWS: !Ref AWS::AccountId
+            Service:
+              - sns.amazonaws.com
+          Resource:
+            - !GetAtt Queue.Arn
+
+  Subscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !GetAtt Queue.Arn
+      Protocol: sqs
+      TopicArn: !Ref Topic
+
+  Lambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/
+      Handler: index.handler
+      Runtime: nodejs18.x
+      Timeout: !FindInMap [ Configuration, lambda, Timeout ]
+      Policies:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${Lambda}
+      RetentionInDays: !FindInMap [ Configuration, log, RetentionInDays ]
+
+  Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt Lambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: sqs.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  EventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      EventSourceArn: !GetAtt Queue.Arn
+      FunctionName: !GetAtt Lambda.Arn
+      Enabled: True
